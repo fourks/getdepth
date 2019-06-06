@@ -29,6 +29,9 @@
 // センサの数
 constexpr int sensorCount(3);
 
+// ヘッドトラッキングの自由度 (3 または 6)
+#define DEGREE_OF_FREEDOM 6
+
 // OpenCV によるビデオキャプチャに使うカメラ
 #define CAPTURE_DEVICE 1
 
@@ -95,6 +98,9 @@ static void updateVariance(const GgApplication::Window *window, int key, int sca
     }
   }
 }
+
+// HMD の初期位置に対するデプスセンサの位置
+constexpr GLfloat origin[] = { 0.0f, 1.0f, -5.0f };
 
 //
 // アプリケーションの実行
@@ -212,73 +218,102 @@ void GgApplication::run()
     }
 #endif
 
-    // すべてのセンサについて
-    for (auto &sensor : sensors)
+    // 描画開始
+    if (window.begin())
     {
-      // 頂点位置の取得
+      // すべてのセンサについて
+      for (auto &sensor : sensors)
+      {
+        // 頂点位置の取得
 #if USE_SHADER
-      sensor->getPosition();
+        sensor->getPosition();
 #else
-      sensor->getPoint();
+        sensor->getPoint();
 #endif
 
-      // カラーデータの取得
-      sensor->getColor();
+        // カラーデータの取得
+        sensor->getColor();
 
-      // 法線ベクトルの計算
-      sensor->getNormal();
-    }
+        // 法線ベクトルの計算
+        sensor->getNormal();
+      }
 
-    // モデル変換行列
-    const GgMatrix mm(window.getTrackball(1) * window.getTranslation(0));
+      // モデル変換行列
+      const GgMatrix mm(window.getTrackball(1) * window.getTranslation(0));
 
-    // 投影変換行列
-    const GgMatrix mp(ggPerspective(cameraFovy, window.getAspect(), cameraNear, cameraFar));
+      // すべての目について
+      for (int eye = 0; eye < window.eyeCount; ++eye)
+      {
+        // スクリーンの大きさ, HMD の位置, HMD の方向
+        GLfloat screen[4], position[3], orientation[4];
 
-    // 画面消去
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // 描画する目を選択してトラッキング情報を得る
+        window.select(eye, screen, position, orientation);
 
-    // すべてのセンサについて
-    for (auto &sensor : sensors)
-    {
-      // 描画用のシェーダプログラムの使用開始
-      simple.use(mp, mm * sensor->attitude, light);
-      material.select();
+        // 視野変換行列
+        const GgMatrix mv(GgQuaternion(orientation).getConjugateMatrix()
+#if DEGREE_OF_FREEDOM == 6
+          * ggTranslate(origin[0] - position[0], origin[1] - position[1], origin[2] - position[2]));
+#else
+          * ggTranslate(0.032f * (1 - 2 * eye), 0.0f, 0.0f));
+#endif
 
-      // カメラ座標のテクスチャ
-      glUniform1i(pointLoc, 0);
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, sensor->getPointTexture());
+        // 投影変換行列
+        const GgMatrix mp(ggFrustum(screen[0] * cameraNear, screen[1] * cameraNear,
+          screen[2] * cameraNear, screen[3] * cameraNear, cameraNear, cameraFar));
+
+        // Time Worp 処理の準備 (CV1 以降では不要)
+        window.timewarp(mp);
+
+        // 画面消去
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // すべてのセンサについて
+        for (auto &sensor : sensors)
+        {
+          // 描画用のシェーダプログラムの使用開始
+          simple.use(mp, mv * mm * sensor->attitude, light);
+          material.select();
+
+          // カメラ座標のテクスチャ
+          glUniform1i(pointLoc, 0);
+          glActiveTexture(GL_TEXTURE0);
+          glBindTexture(GL_TEXTURE_2D, sensor->getPointTexture());
 
 #if USE_REFRACTION
-      // 背景テクスチャ
-      glUniform1i(backLoc, 1);
-      glActiveTexture(GL_TEXTURE1);
-      glBindTexture(GL_TEXTURE_2D, bmap);
+          // 背景テクスチャ
+          glUniform1i(backLoc, 1);
+          glActiveTexture(GL_TEXTURE1);
+          glBindTexture(GL_TEXTURE_2D, bmap);
 
-      // ウィンドウサイズ
-      glUniform2iv(windowSizeLoc, 1, window.getSize());
+          // ウィンドウサイズ
+          glUniform2iv(windowSizeLoc, 1, window.getSize());
 #else
-      // 前景テクスチャ
-      glUniform1i(colorLoc, 1);
-      glActiveTexture(GL_TEXTURE1);
-      glBindTexture(GL_TEXTURE_2D, sensor->getColorTexture());
+          // 前景テクスチャ
+          glUniform1i(colorLoc, 1);
+          glActiveTexture(GL_TEXTURE1);
+          glBindTexture(GL_TEXTURE_2D, sensor->getColorTexture());
 
-      // テクスチャ座標のシェーダストレージバッファオブジェクト
-      glBindBufferBase(GL_SHADER_STORAGE_BUFFER, DepthCamera::UvmapBinding, sensor->getUvmapBuffer());
+          // テクスチャ座標のシェーダストレージバッファオブジェクト
+          glBindBufferBase(GL_SHADER_STORAGE_BUFFER, DepthCamera::UvmapBinding, sensor->getUvmapBuffer());
 
-      // 疑似カラー処理
-      glUniform2fv(rangeLoc, 1, sensor->range);
+          // 疑似カラー処理
+          glUniform2fv(rangeLoc, 1, sensor->range);
 #endif
 
-      // 法線ベクトルののシェーダストレージバッファオブジェクト
-      glBindBufferBase(GL_SHADER_STORAGE_BUFFER, DepthCamera::NormalBinding, sensor->getNormalBuffer());
+          // 法線ベクトルののシェーダストレージバッファオブジェクト
+          glBindBufferBase(GL_SHADER_STORAGE_BUFFER, DepthCamera::NormalBinding, sensor->getNormalBuffer());
 
-      // 図形描画
-      sensor->draw();
+          // 図形描画
+          sensor->draw();
+        }
+
+        // 片目の描画を完了する
+        window.commit(eye);
+      }
+
+      // フレームを転送する
+      window.submit();
     }
-
-    // バッファを入れ替える
-    window.swapBuffers();
   }
 }
